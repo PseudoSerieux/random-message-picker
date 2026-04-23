@@ -142,6 +142,7 @@ async def startgame(interaction: discord.Interaction):
         "message_id": message_cible.id,
         "channel_id": interaction.channel_id,
         "task":       None,
+        "reponses":   {},  # user_id → nombre de réponses
     }
 
     embed = discord.Embed(
@@ -258,6 +259,13 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
+    # Vérifier si l'utilisateur a déjà répondu 2 fois
+    user_id = message.author.id
+    if partie["reponses"].get(user_id, 0) >= 2:
+        await message.channel.send(f"🙈 {message.author.mention} a dépassé son quota de réponses (2) pour cette manche ! 👮‍♀️🫵")
+        await bot.process_commands(message)
+        return
+
     nom_auteur = partie["auteur_nom"].lower().strip()
     reponse    = message.content.lower().strip()
 
@@ -278,6 +286,10 @@ async def on_message(message):
         )
         await message.channel.send(embed=embed)
         del parties_en_cours[guild_id]
+
+    else:
+        # Incrémenter le compteur de réponses pour cet utilisateur
+        partie["reponses"][user_id] = partie["reponses"].get(user_id, 0) + 1
 
     await bot.process_commands(message)
 
