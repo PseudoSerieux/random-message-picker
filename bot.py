@@ -216,8 +216,7 @@ async def monstats(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="stopgame", description="(Admin) Arrête la partie en cours et révèle la réponse")
-@app_commands.checks.has_permissions(manage_messages=True)
+@bot.tree.command(name="stopgame", description="Arrête la partie en cours et révèle la réponse")
 async def stopgame(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     if guild_id not in parties_en_cours:
@@ -225,6 +224,8 @@ async def stopgame(interaction: discord.Interaction):
         return
     await interaction.response.send_message("🛑 Partie arrêtée par un admin.", ephemeral=True)
     channel = bot.get_channel(parties_en_cours[guild_id]["channel_id"])
+    if channel is None:
+        channel = await bot.fetch_channel(parties_en_cours[guild_id]["channel_id"])
     await _terminer_partie(channel, guild_id, reveler=True, force_stop=True)
 
 
@@ -254,11 +255,6 @@ async def on_message(message):
     partie = parties_en_cours[guild_id]
 
     if message.channel.id != partie["channel_id"]:
-        await bot.process_commands(message)
-        return
-
-    # L'auteur du message mystère ne peut pas deviner le sien
-    if message.author.id == partie["auteur_id"]:
         await bot.process_commands(message)
         return
 
@@ -337,6 +333,12 @@ async def _timer_fin(channel_id, guild_id):
     await asyncio.sleep(TIMER_SECONDES)
     if guild_id in parties_en_cours:
         channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception:
+                del parties_en_cours[guild_id]
+                return
         await _terminer_partie(channel, guild_id, reveler=True)
 
 async def _terminer_partie(channel, guild_id, reveler=False, force_stop=False):
