@@ -1,10 +1,10 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 import sqlite3
 import random
 import asyncio
 import re
-from datetime import datetime
 import os
 from dotenv import load_dotenv
 
@@ -15,23 +15,24 @@ load_dotenv()
 #  CONFIG  →  modifie ces valeurs
 # ─────────────────────────────────────────
 TOKEN = os.getenv('TOKEN')
-PREFIX = "!"
-TIMER_SECONDES = 60          # temps pour deviner
-MIN_CHARS = 20               # longueur minimale d'un message pioché
-MAX_CHARS = 300              # longueur maximale
-POINTS_VICTOIRE = 1          # points gagnés si bonne réponse
+TIMER_SECONDES = 60
+
+MIN_CHARS = 20
+MAX_CHARS = 300
+POINTS_VICTOIRE = 1
 
 # Noms exacts des channels à exclure (insensible à la casse)
 NOMS_CHANNELS_EXCLUS = [
     "lp-tracker",
     "☎️-gartic-phone",
     "🎥stream",
+    "🎵dj-fred",
     "🏠images-minecraft",
 ]
 
 # Noms exacts des catégories à exclure (insensible à la casse)
 NOMS_CATEGORIES_EXCLUSES = [
-    "Mudae",
+    "📈Mudae",
 ]
 
 # Rôle minimum requis pour que les messages soient sélectionnés
@@ -47,7 +48,16 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+class Bot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # Synchronise les slash commands avec Discord au démarrage
+        await self.tree.sync()
+        print("✅ Slash commands synchronisées !")
+
+bot = Bot()
 
 # ── Base de données ───────────────────────
 def init_db():
@@ -95,192 +105,216 @@ def get_classement(guild_id, limit=10):
     return rows
 
 # ── État des parties en cours ─────────────
-parties_en_cours = {}   # guild_id → { auteur, message_id, task }
+parties_en_cours = {}  # guild_id → dict
 
 # ── Événements ───────────────────────────
 @bot.event
 async def on_ready():
     init_db()
     print(f"✅ Bot connecté en tant que {bot.user} !")
-    await bot.change_presence(activity=discord.Game("!startgame pour jouer 🎮"))
+    await bot.change_presence(activity=discord.Game("/startgame pour jouer 🎮"))
 
-# ── Commandes ────────────────────────────
+# ── Slash Commands ────────────────────────
 
-@bot.command(name="startgame", aliases=["sg", "start"])
-async def startgame(ctx):
-    """Lance une partie : pioche un message aléatoire à deviner."""
-    guild_id = ctx.guild.id
+@bot.tree.command(name="startgame", description="Lance une partie — devine qui a écrit le message mystère !")
+async def startgame(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
 
     if guild_id in parties_en_cours:
-        await ctx.send("⚠️ Une partie est déjà en cours ! Attendez qu'elle se termine.")
+        await interaction.response.send_message(
+            "⚠️ Hé oh !Une partie est déjà en cours ! Attendez qu'elle se termine.", ephemeral=True
+        )
         return
 
-    await ctx.send("🔍 Je cherche un message mystère...")
+    await interaction.response.send_message("🕵️‍♀️ Je cherche un message mystère...")
 
-    # Récupère un message aléatoire valide
-    message_cible = await _piocher_message(ctx)
+    message_cible = await _piocher_message(interaction)
     if not message_cible:
-        await ctx.send("❌ Impossible de trouver un message valide. Essaie dans un autre channel !")
+        await interaction.edit_original_response(content="❌ Impossible de trouver un message valide !")
         return
 
-    auteur = message_cible.author
+    auteur  = message_cible.author
     contenu = message_cible.content
 
-    # Démarre la partie
     parties_en_cours[guild_id] = {
-        "auteur_id":   auteur.id,
-        "auteur_nom":  auteur.display_name,
-        "message_id":  message_cible.id,
-        "channel_id":  ctx.channel.id,
-        "task":        None,
+        "auteur_id":  auteur.id,
+        "auteur_nom": auteur.display_name,
+        "message_id": message_cible.id,
+        "channel_id": interaction.channel_id,
+        "task":       None,
     }
 
     embed = discord.Embed(
-        title="🎭  Qui a écrit ce message ?",
+        title="🥸 Qui a écrit ce message ?",
         description=f"```{contenu}```",
         color=discord.Color.blurple()
     )
     embed.set_footer(text=f"⏳ Vous avez {TIMER_SECONDES} secondes — écrivez le pseudo dans le chat !")
-    await ctx.send(embed=embed)
+    await interaction.edit_original_response(content=None, embed=embed)
 
-    # Lance le timer
-    task = asyncio.create_task(_timer_fin(ctx, guild_id))
+    task = asyncio.create_task(_timer_fin(interaction.channel_id, guild_id))
     parties_en_cours[guild_id]["task"] = task
 
 
-@bot.command(name="classement", aliases=["top", "scores", "leaderboard"])
-async def classement(ctx):
-    """Affiche le classement du serveur."""
-    rows = get_classement(ctx.guild.id)
+@bot.tree.command(name="classement", description="Affiche le top 10 des joueurs du serveur")
+async def classement(interaction: discord.Interaction):
+    rows = get_classement(interaction.guild_id)
     if not rows:
-        await ctx.send("📊 Aucun score pour le moment. Lance une partie avec `!startgame` !")
+        await interaction.response.send_message(
+            "📊 Aucun score pour le moment. Lance une partie avec `/startgame` !", ephemeral=True
+        )
         return
 
     medailles = ["🥇", "🥈", "🥉"]
     lignes = []
     for i, (username, points, victoires) in enumerate(rows):
         medaille = medailles[i] if i < 3 else f"`{i+1}.`"
-        lignes.append(f"{medaille} **{username}** — {points} pt{'s' if points > 1 else ''}  *(x{victoires} victoire{'s' if victoires > 1 else ''})*")
+        lignes.append(
+            f"{medaille} **{username}** — {points} pt{'s' if points > 1 else ''}  "
+            f"*(x{victoires} victoire{'s' if victoires > 1 else ''})*"
+        )
 
     embed = discord.Embed(
         title="🏆  Classement général",
         description="\n".join(lignes),
         color=discord.Color.gold()
     )
-    embed.set_footer(text=f"Serveur : {ctx.guild.name}")
-    await ctx.send(embed=embed)
+    embed.set_footer(text=f"Serveur : {interaction.guild.name}")
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name="stopsame", aliases=["stop"])
-@commands.has_permissions(manage_messages=True)
-async def stopgame(ctx):
-    """(Admin) Arrête la partie en cours."""
-    guild_id = ctx.guild.id
-    if guild_id not in parties_en_cours:
-        await ctx.send("Aucune partie en cours.")
+@bot.tree.command(name="monstats", description="Affiche tes propres statistiques")
+async def monstats(interaction: discord.Interaction):
+    con = sqlite3.connect("classement.db")
+    row = con.execute(
+        "SELECT username, points, victoires FROM scores WHERE guild_id=? AND user_id=?",
+        (interaction.guild_id, interaction.user.id)
+    ).fetchone()
+    rang = None
+    if row:
+        rang_row = con.execute("""
+            SELECT COUNT(*) + 1 FROM scores
+            WHERE guild_id = ? AND points > ?
+        """, (interaction.guild_id, row[1])).fetchone()
+        rang = rang_row[0] if rang_row else "?"
+    con.close()
+
+    if not row:
+        await interaction.response.send_message(
+            "📊 Tu n'as pas encore de score ! Lance une partie avec `/startgame`.", ephemeral=True
+        )
         return
-    await _terminer_partie(ctx.channel, guild_id, reveler=True, force_stop=True)
+
+    username, points, victoires = row
+    embed = discord.Embed(
+        title=f"📊  Stats de {interaction.user.display_name}",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="🏅 Points",     value=str(points),    inline=True)
+    embed.add_field(name="🎯 Victoires",  value=str(victoires), inline=True)
+    embed.add_field(name="🏆 Classement", value=f"#{rang}",     inline=True)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name="aide", aliases=["help_jeu"])
-async def aide(ctx):
-    """Affiche l'aide du bot."""
+@bot.tree.command(name="stopgame", description="(Admin) Arrête la partie en cours et révèle la réponse")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def stopgame(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    if guild_id not in parties_en_cours:
+        await interaction.response.send_message("🤔 Aucune partie n'est en cours.", ephemeral=True)
+        return
+    await interaction.response.send_message("🛑 Partie arrêtée par un admin.", ephemeral=True)
+    channel = bot.get_channel(parties_en_cours[guild_id]["channel_id"])
+    await _terminer_partie(channel, guild_id, reveler=True, force_stop=True)
+
+
+@bot.tree.command(name="aide", description="Affiche toutes les commandes disponibles")
+async def aide(interaction: discord.Interaction):
     embed = discord.Embed(title="📖  Aide — Qui a dit ça ?", color=discord.Color.green())
-    embed.add_field(name="`!startgame`",  value="Lance une nouvelle partie",       inline=False)
-    embed.add_field(name="`!classement`", value="Affiche le top 10 du serveur",    inline=False)
-    embed.add_field(name="`!stopsame`",   value="(Admin) Arrête la partie en cours", inline=False)
-    embed.set_footer(text=f"Préfixe : {PREFIX}  •  Timer : {TIMER_SECONDES}s")
-    await ctx.send(embed=embed)
+    embed.add_field(name="/startgame",  value="Lance une nouvelle partie",           inline=False)
+    embed.add_field(name="/classement", value="Affiche le top 10 du serveur",        inline=False)
+    embed.add_field(name="/monstats",   value="Tes points, victoires et classement", inline=False)
+    embed.add_field(name="/stopgame",   value="(Admin) Arrête la partie en cours",   inline=False)
+    embed.set_footer(text=f"Timer : {TIMER_SECONDES}s  •  Rôle minimum : {ROLE_MINIMUM}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── Détection des réponses ─────────────────
+# ── Détection des réponses dans le chat ───
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
 
-    guild_id = message.guild.id if message.guild else None
-    if guild_id and guild_id in parties_en_cours:
-        partie = parties_en_cours[guild_id]
+    guild_id = message.guild.id
+    if guild_id not in parties_en_cours:
+        await bot.process_commands(message)
+        return
 
-        # Vérifie que le message est dans le bon channel
-        if message.channel.id != partie["channel_id"]:
-            await bot.process_commands(message)
-            return
+    partie = parties_en_cours[guild_id]
 
-        # Ignore les commandes
-        if message.content.startswith(PREFIX):
-            await bot.process_commands(message)
-            return
+    if message.channel.id != partie["channel_id"]:
+        await bot.process_commands(message)
+        return
 
-        # Compare la réponse (insensible à la casse)
-        nom_auteur = partie["auteur_nom"].lower().strip()
-        reponse    = message.content.lower().strip()
+    # L'auteur du message mystère ne peut pas deviner le sien
+    if message.author.id == partie["auteur_id"]:
+        await bot.process_commands(message)
+        return
 
-        if reponse == nom_auteur or reponse in nom_auteur or nom_auteur in reponse:
-            # Bonne réponse !
-            if partie["task"]:
-                partie["task"].cancel()
+    nom_auteur = partie["auteur_nom"].lower().strip()
+    reponse    = message.content.lower().strip()
 
-            ajouter_point(guild_id, message.author.id, message.author.display_name)
+    if reponse == nom_auteur or reponse in nom_auteur or nom_auteur in reponse:
+        if partie["task"]:
+            partie["task"].cancel()
 
-            embed = discord.Embed(
-                title="✅  Bonne réponse !",
-                description=(
-                    f"🎉 **{message.author.display_name}** a trouvé !\n"
-                    f"Le message avait été écrit par **{partie['auteur_nom']}**.\n"
-                    f"+{POINTS_VICTOIRE} point{'s' if POINTS_VICTOIRE > 1 else ''} au classement !"
-                ),
-                color=discord.Color.green()
-            )
-            await message.channel.send(embed=embed)
-            del parties_en_cours[guild_id]
+        ajouter_point(guild_id, message.author.id, message.author.display_name)
+
+        embed = discord.Embed(
+            title="💃 Bonne réponse !",
+            description=(
+                f"🎉 **{message.author.display_name}** a trouvé.e !\n"
+                f"Le message avait été écrit par **{partie['auteur_nom']}**.\n"
+                f"+{POINTS_VICTOIRE} point{'s' if POINTS_VICTOIRE > 1 else ''} au classement ! 😎"
+            ),
+            color=discord.Color.green()
+        )
+        await message.channel.send(embed=embed)
+        del parties_en_cours[guild_id]
 
     await bot.process_commands(message)
 
 
 # ── Helpers internes ───────────────────────
 def _a_role_suffisant(member: discord.Member, guild: discord.Guild) -> bool:
-    """Retourne True si le membre possède le rôle minimum requis ou un rôle de position supérieure."""
     role_min = discord.utils.get(guild.roles, name=ROLE_MINIMUM)
     if role_min is None:
-        return False  # rôle introuvable → on refuse plutôt que d'accepter tout le monde
-    # On accepte le rôle exact ET tout rôle avec une position hiérarchique >= au rôle minimum
+        return False
     return any(r.position >= role_min.position for r in member.roles)
 
 def _message_est_valide(msg: discord.Message) -> bool:
-    """Vérifie qu'un message ne contient que du texte brut (pas de lien, gif, image, embed)."""
-    # Pièces jointes (images, fichiers, gifs uploadés)
     if msg.attachments:
         return False
-    # Embeds (liens riches, aperçus YouTube, Tenor/Giphy, etc.)
     if msg.embeds:
         return False
-    # Liens dans le texte
     if RE_LIEN.search(msg.content):
         return False
-    # Emojis personnalisés Discord (<:nom:id> ou <a:nom:id> pour les animés/gifs)
     if re.search(r"<a?:\w+:\d+>", msg.content):
         return False
     return True
 
-async def _piocher_message(ctx):
-    """Parcourt les channels du serveur et retourne un message aléatoire valide."""
+async def _piocher_message(interaction: discord.Interaction):
     candidats = []
-
-    noms_channels_exclus  = {n.lower() for n in NOMS_CHANNELS_EXCLUS}
+    noms_channels_exclus   = {n.lower() for n in NOMS_CHANNELS_EXCLUS}
     noms_categories_exclus = {n.lower() for n in NOMS_CATEGORIES_EXCLUSES}
 
-    for channel in ctx.guild.text_channels:
-        # Exclure par nom de channel
+    for channel in interaction.guild.text_channels:
         if channel.name.lower() in noms_channels_exclus:
             continue
-        # Exclure par nom de catégorie
         if channel.category and channel.category.name.lower() in noms_categories_exclus:
             continue
-        # Vérifie les permissions du bot
-        perms = channel.permissions_for(ctx.guild.me)
+        perms = channel.permissions_for(interaction.guild.me)
         if not perms.read_message_history:
             continue
         try:
@@ -288,9 +322,8 @@ async def _piocher_message(ctx):
                 if (
                     not msg.author.bot
                     and MIN_CHARS <= len(msg.content) <= MAX_CHARS
-                    and not msg.content.startswith(PREFIX)
                     and _message_est_valide(msg)
-                    and _a_role_suffisant(msg.author, ctx.guild)
+                    and _a_role_suffisant(msg.author, interaction.guild)
                 ):
                     candidats.append(msg)
         except (discord.Forbidden, discord.HTTPException):
@@ -300,34 +333,29 @@ async def _piocher_message(ctx):
         return None
     return random.choice(candidats)
 
-
-async def _timer_fin(ctx, guild_id):
-    """Appelé quand le timer expire sans bonne réponse."""
+async def _timer_fin(channel_id, guild_id):
     await asyncio.sleep(TIMER_SECONDES)
     if guild_id in parties_en_cours:
-        channel = bot.get_channel(parties_en_cours[guild_id]["channel_id"])
+        channel = bot.get_channel(channel_id)
         await _terminer_partie(channel, guild_id, reveler=True)
 
-
 async def _terminer_partie(channel, guild_id, reveler=False, force_stop=False):
-    """Termine la partie et révèle éventuellement l'auteur."""
     if guild_id not in parties_en_cours:
         return
     partie = parties_en_cours[guild_id]
 
     if reveler:
         if force_stop:
-            desc = f"🛑 Partie arrêtée par un admin.\nC'était **{partie['auteur_nom']}** !"
+            desc  = f"🛑 Partie arrêtée.\nL'auteur était **{partie['auteur_nom']}** ! ☝️🤓"
             color = discord.Color.orange()
         else:
-            desc = f"⏰ Temps écoulé ! Personne n'a trouvé...\nC'était **{partie['auteur_nom']}** !"
+            desc  = f"⏰ Temps écoulé ! Personne n'a trouvé...\n Actually l'auteur était **{partie['auteur_nom']}** ! ☝️🤓"
             color = discord.Color.red()
 
-        embed = discord.Embed(title="❌  Personne n'a deviné", description=desc, color=color)
+        embed = discord.Embed(title="❌ Personne n'a deviné, bande de nullos. 🤢", description=desc, color=color)
         await channel.send(embed=embed)
 
     del parties_en_cours[guild_id]
-
 
 # ── Lancement ─────────────────────────────
 bot.run(TOKEN)
