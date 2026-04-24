@@ -6,6 +6,7 @@ import random
 import asyncio
 import re
 import os
+import uuid
 from dotenv import load_dotenv
 
 # Charger les variables d'environnement depuis .env
@@ -18,9 +19,9 @@ TOKEN = os.getenv('TOKEN')
 TIMER_SECONDES = int(os.getenv('TIMER_SECONDES', '60'))
 MIN_CHARS = int(os.getenv('MIN_CHARS', '20'))
 MAX_CHARS = int(os.getenv('MAX_CHARS', '300'))
-POINTS_VICTOIRE = int(os.getenv('POINTS_VICTOIRE', '1'))
 MAX_REPONSES_PAR_JOUEUR = int(os.getenv('MAX_REPONSES_PAR_JOUEUR', '2'))
 ROLE_MINIMUM = os.getenv('ROLE_MINIMUM', 'Prokobz')
+CHANNEL_AUTO = os.getenv('CHANNEL_AUTO', 'whosaidthat')
 
 # Charger les listes depuis .env (séparées par des virgules)
 NOMS_CHANNELS_EXCLUS = [
@@ -48,6 +49,7 @@ class Bot(commands.Bot):
         # Synchronise les slash commands avec Discord au démarrage
         await self.tree.sync()
         print("✅ Slash commands synchronisées !")
+        self.loop.create_task(boucle_auto())
 
 bot = Bot()
 
@@ -55,44 +57,92 @@ bot = Bot()
 def init_db():
     con = sqlite3.connect("classement.db")
     cur = con.cursor()
+
+    # Crée les tables si elles n'existent pas
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scores (
-            guild_id    INTEGER,
-            user_id     INTEGER,
-            username    TEXT,
-            points      INTEGER DEFAULT 0,
-            victoires   INTEGER DEFAULT 0,
+            guild_id        INTEGER,
+            user_id         INTEGER,
+            username        TEXT,
+            points          INTEGER DEFAULT 0,
+            bonnes_reponses INTEGER DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS session_scores (
+            guild_id        INTEGER,
+            session_id      TEXT,
+            user_id         INTEGER,
+            username        TEXT,
+            points          INTEGER DEFAULT 0,
+            bonnes_reponses INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, session_id, user_id)
+        )
+    """)
+
+    # Migration : ajoute bonnes_reponses si elle n'existe pas encore (ancienne DB)
+    colonnes = [row[1] for row in cur.execute("PRAGMA table_info(scores)").fetchall()]
+    if "bonnes_reponses" not in colonnes:
+        cur.execute("ALTER TABLE scores ADD COLUMN bonnes_reponses INTEGER DEFAULT 0")
+        print("✅ Migration DB : colonne bonnes_reponses ajoutée à scores.")
+
     con.commit()
     con.close()
 
-def ajouter_point(guild_id, user_id, username):
+sessions_actives = {}  # guild_id → session_id
+
+def session_reset(guild_id):
+    sessions_actives[guild_id] = str(uuid.uuid4())
     con = sqlite3.connect("classement.db")
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO scores (guild_id, user_id, username, points, victoires)
-        VALUES (?, ?, ?, 1, 1)
+    con.execute("DELETE FROM session_scores WHERE guild_id = ?", (guild_id,))
+    con.commit()
+    con.close()
+
+def session_ajouter_points(guild_id, user_id, username, points):
+    session_id = sessions_actives.get(guild_id, "default")
+    con = sqlite3.connect("classement.db")
+    con.execute("""
+        INSERT INTO scores (guild_id, user_id, username, points, bonnes_reponses)
+        VALUES (?, ?, ?, ?, 1)
         ON CONFLICT(guild_id, user_id) DO UPDATE SET
-            points    = points + 1,
-            victoires = victoires + 1,
-            username  = excluded.username
-    """, (guild_id, user_id, username))
+            points          = points + ?,
+            bonnes_reponses = bonnes_reponses + 1,
+            username        = excluded.username
+    """, (guild_id, user_id, username, points, points))
+    con.execute("""
+        INSERT INTO session_scores (guild_id, session_id, user_id, username, points, bonnes_reponses)
+        VALUES (?, ?, ?, ?, ?, 1)
+        ON CONFLICT(guild_id, session_id, user_id) DO UPDATE SET
+            points          = points + ?,
+            bonnes_reponses = bonnes_reponses + 1,
+            username        = excluded.username
+    """, (guild_id, session_id, user_id, username, points, points))
     con.commit()
     con.close()
 
-def get_classement(guild_id, limit=10):
+def session_get_classement(guild_id, limit=10):
+    session_id = sessions_actives.get(guild_id)
+    if not session_id:
+        return []
     con = sqlite3.connect("classement.db")
-    cur = con.cursor()
-    cur.execute("""
-        SELECT username, points, victoires
+    rows = con.execute("""
+        SELECT username, points, bonnes_reponses
+        FROM session_scores
+        WHERE guild_id = ? AND session_id = ?
+        ORDER BY points DESC LIMIT ?
+    """, (guild_id, session_id, limit)).fetchall()
+    con.close()
+    return rows
+
+def get_classement_global(guild_id, limit=10):
+    con = sqlite3.connect("classement.db")
+    rows = con.execute("""
+        SELECT username, points, bonnes_reponses
         FROM scores
         WHERE guild_id = ?
-        ORDER BY points DESC
-        LIMIT ?
-    """, (guild_id, limit))
-    rows = cur.fetchall()
+        ORDER BY points DESC LIMIT ?
+    """, (guild_id, limit)).fetchall()
     con.close()
     return rows
 
@@ -114,20 +164,21 @@ async def startgame(interaction: discord.Interaction):
 
     if guild_id in parties_en_cours:
         await interaction.response.send_message(
-            "⚠️ Hé oh !Une partie est déjà en cours ! Attendez qu'elle se termine.", ephemeral=True
+            "⚠️ Hé oh ! Une partie est déjà en cours ! Attendez qu'elle se termine.", ephemeral=True
         )
         return
 
+    session_reset(guild_id)
     await interaction.response.send_message("🕵️‍♀️ Je cherche un message mystère...")
 
-    message_cible = await _piocher_message(interaction)
+    message_cible = await _piocher_message_guild(interaction.guild)
     if not message_cible:
         await interaction.edit_original_response(content="❌ Impossible de trouver un message valide !")
         return
 
     auteur  = message_cible.author
     contenu = message_cible.content
-    annee = message_cible.created_at.year
+    annee   = message_cible.created_at.year
 
     parties_en_cours[guild_id] = {
         "auteur_id":  auteur.id,
@@ -135,11 +186,12 @@ async def startgame(interaction: discord.Interaction):
         "message_id": message_cible.id,
         "channel_id": interaction.channel_id,
         "task":       None,
-        "reponses":   {},  # user_id → nombre de réponses
+        "reponses":   {},
+        "a_repondu":  False,
     }
 
     embed = discord.Embed(
-        title="🥸  Qui a écrit ce message en " + str(annee) +" ?",
+        title="🥸  Qui a écrit ce message en " + str(annee) + " ?",
         description=f"```{contenu}```",
         color=discord.Color.blurple()
     )
@@ -150,9 +202,9 @@ async def startgame(interaction: discord.Interaction):
     parties_en_cours[guild_id]["task"] = task
 
 
-@bot.tree.command(name="classement", description="Affiche le top 10 des joueurs du serveur")
+@bot.tree.command(name="classement", description="Affiche le classement de la session en cours")
 async def classement(interaction: discord.Interaction):
-    rows = get_classement(interaction.guild_id)
+    rows = session_get_classement(interaction.guild_id)
     if not rows:
         await interaction.response.send_message(
             "📊 Aucun score pour le moment. Lance une partie avec `/startgame` !", ephemeral=True
@@ -161,15 +213,40 @@ async def classement(interaction: discord.Interaction):
 
     medailles = ["🥇", "🥈", "🥉"]
     lignes = []
-    for i, (username, points, victoires) in enumerate(rows):
+    for i, (username, points, bonnes_reponses) in enumerate(rows):
         medaille = medailles[i] if i < 3 else f"`{i+1}.`"
         lignes.append(
             f"{medaille} **{username}** — {points} pt{'s' if points > 1 else ''}  "
-            f"*(x{victoires} victoire{'s' if victoires > 1 else ''})*"
+            f"*(x{bonnes_reponses} victoire{'s' if bonnes_reponses > 1 else ''})*"
         )
 
     embed = discord.Embed(
-        title="🏆  Classement général",
+        title="🏆  Classement — session en cours",
+        description="\n".join(lignes),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text=f"Serveur : {interaction.guild.name}  •  Reset à chaque /startgame")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="classement-global", description="Affiche le classement général all-time")
+async def classement_global(interaction: discord.Interaction):
+    rows = get_classement_global(interaction.guild_id)
+    if not rows:
+        await interaction.response.send_message(
+            "📊 Aucun score enregistré. Lance une partie avec `/startgame` !", ephemeral=True
+        )
+        return
+    medailles = ["🥇", "🥈", "🥉"]
+    lignes = []
+    for i, (username, points, bonnes_reponses) in enumerate(rows):
+        medaille = medailles[i] if i < 3 else f"`{i+1}.`"
+        lignes.append(
+            f"{medaille} **{username}** — {points} pt{'s' if points > 1 else ''}  "
+            f"*(x{bonnes_reponses} victoire{'s' if bonnes_reponses > 1 else ''})*"
+        )
+    embed = discord.Embed(
+        title="🏆  Classement général — all time",
         description="\n".join(lignes),
         color=discord.Color.gold()
     )
@@ -177,36 +254,34 @@ async def classement(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="monstats", description="Affiche tes propres statistiques")
-async def monstats(interaction: discord.Interaction):
+@bot.tree.command(name="messtats", description="Affiche tes propres statistiques all-time")
+async def messtats(interaction: discord.Interaction):
     con = sqlite3.connect("classement.db")
     row = con.execute(
-        "SELECT username, points, victoires FROM scores WHERE guild_id=? AND user_id=?",
+        "SELECT username, points, bonnes_reponses FROM scores WHERE guild_id=? AND user_id=?",
         (interaction.guild_id, interaction.user.id)
     ).fetchone()
     rang = None
     if row:
-        rang_row = con.execute("""
-            SELECT COUNT(*) + 1 FROM scores
-            WHERE guild_id = ? AND points > ?
-        """, (interaction.guild_id, row[1])).fetchone()
+        rang_row = con.execute(
+            "SELECT COUNT(*) + 1 FROM scores WHERE guild_id = ? AND points > ?",
+            (interaction.guild_id, row[1])
+        ).fetchone()
         rang = rang_row[0] if rang_row else "?"
     con.close()
-
     if not row:
         await interaction.response.send_message(
             "📊 Tu n'as pas encore de score ! Lance une partie avec `/startgame`.", ephemeral=True
         )
         return
-
-    username, points, victoires = row
+    username, points, bonnes_reponses = row
     embed = discord.Embed(
         title=f"📊  Stats de {interaction.user.display_name}",
         color=discord.Color.blurple()
     )
-    embed.add_field(name="🏅 Points",     value=str(points),    inline=True)
-    embed.add_field(name="🎯 Victoires",  value=str(victoires), inline=True)
-    embed.add_field(name="🏆 Classement", value=f"#{rang}",     inline=True)
+    embed.add_field(name="🏅 Points",          value=str(points),          inline=True)
+    embed.add_field(name="🎯 Victoires",       value=str(bonnes_reponses), inline=True)
+    embed.add_field(name="🏆 Classement",      value=f"#{rang}",           inline=True)
     await interaction.response.send_message(embed=embed)
 
 
@@ -216,7 +291,7 @@ async def stopgame(interaction: discord.Interaction):
     if guild_id not in parties_en_cours:
         await interaction.response.send_message("🤔 Aucune partie n'est en cours.", ephemeral=True)
         return
-    await interaction.response.send_message("🛑 Partie arrêtée par un admin.", ephemeral=True)
+    await interaction.response.send_message("🛑 Partie arrêtée.", ephemeral=True)
     channel = bot.get_channel(parties_en_cours[guild_id]["channel_id"])
     if channel is None:
         channel = await bot.fetch_channel(parties_en_cours[guild_id]["channel_id"])
@@ -226,11 +301,12 @@ async def stopgame(interaction: discord.Interaction):
 @bot.tree.command(name="aide", description="Affiche toutes les commandes disponibles")
 async def aide(interaction: discord.Interaction):
     embed = discord.Embed(title="📖  Aide — Qui a dit ça ?", color=discord.Color.green())
-    embed.add_field(name="/startgame",  value="Lance une nouvelle partie",           inline=False)
-    embed.add_field(name="/classement", value="Affiche le top 10 du serveur",        inline=False)
-    embed.add_field(name="/monstats",   value="Tes points, victoires et classement", inline=False)
-    embed.add_field(name="/stopgame",   value="(Admin) Arrête la partie en cours",   inline=False)
-    embed.set_footer(text=f"Timer : {TIMER_SECONDES}s  •  Rôle minimum : {ROLE_MINIMUM}  •  Max réponses : {MAX_REPONSES_PAR_JOUEUR}")
+    embed.add_field(name="/startgame",         value="Lance une nouvelle partie (reset le classement de session)", inline=False)
+    embed.add_field(name="/classement",        value="Classement de la session en cours",                         inline=False)
+    embed.add_field(name="/classement-global", value="Classement all-time",                                       inline=False)
+    embed.add_field(name="/messtats",          value="Tes points et stats all-time",                              inline=False)
+    embed.add_field(name="/stopgame",          value="Arrête la partie en cours",                                 inline=False)
+    embed.set_footer(text=f"Timer : {TIMER_SECONDES}s  •  Rôle minimum : {ROLE_MINIMUM}  •  Max essais : {MAX_REPONSES_PAR_JOUEUR}  •  1er try = 3pts / 2e try = 1pt")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -253,11 +329,16 @@ async def on_message(message):
         return
 
     # Vérifier si l'utilisateur a déjà répondu MAX_REPONSES_PAR_JOUEUR fois
-    user_id = message.author.id
-    if partie["reponses"].get(user_id, 0) >= MAX_REPONSES_PAR_JOUEUR:
+    user_id   = message.author.id
+    nb_essais = partie["reponses"].get(user_id, 0)
+
+    if nb_essais >= MAX_REPONSES_PAR_JOUEUR:
         await message.channel.send(f"🙈 {message.author.mention} a dépassé son quota de réponses ({MAX_REPONSES_PAR_JOUEUR}) pour cette manche ! 👮‍♀️🫵")
         await bot.process_commands(message)
         return
+
+    partie["a_repondu"] = True
+    partie["reponses"][user_id] = nb_essais + 1
 
     nom_auteur = partie["auteur_nom"].lower().strip()
     reponse    = message.content.lower().strip()
@@ -266,23 +347,25 @@ async def on_message(message):
         if partie["task"]:
             partie["task"].cancel()
 
-        ajouter_point(guild_id, message.author.id, message.author.display_name)
+        pts = 3 if nb_essais == 0 else 1
+        session_ajouter_points(guild_id, user_id, message.author.display_name, pts)
 
         embed = discord.Embed(
             title="💃 Bonne réponse !",
             description=(
-                f"🎉 **{message.author.display_name}** a trouvé.e !\n"
-                f"Le message avait été écrit par **{partie['auteur_nom']}**.\n"
-                f"+{POINTS_VICTOIRE} point{'s' if POINTS_VICTOIRE > 1 else ''} au classement ! 😎"
+                f"🎉 **{message.author.display_name}** a trouvé !\n"
+                f"Le message a été écrit par **{partie['auteur_nom']}**.\n"
+                f"+{pts} point{'s' if pts > 1 else ''} au classement ! 😎"
             ),
             color=discord.Color.green()
         )
         await message.channel.send(embed=embed)
+
+        channel = message.channel
         del parties_en_cours[guild_id]
 
-    else:
-        # Incrémenter le compteur de réponses pour cet utilisateur
-        partie["reponses"][user_id] = partie["reponses"].get(user_id, 0) + 1
+        await asyncio.sleep(3)
+        await _lancer_manche(channel, channel.guild)
 
     await bot.process_commands(message)
 
@@ -301,30 +384,32 @@ def _message_est_valide(msg: discord.Message) -> bool:
         return False
     if RE_LIEN.search(msg.content):
         return False
+    if RE_TENOR_GIPHY.search(msg.content):
+        return False
     if re.search(r"<a?:\w+:\d+>", msg.content):
         return False
     return True
 
-async def _piocher_message(interaction: discord.Interaction):
+async def _piocher_message_guild(guild: discord.Guild):
     candidats = []
     noms_channels_exclus   = {n.lower() for n in NOMS_CHANNELS_EXCLUS}
     noms_categories_exclus = {n.lower() for n in NOMS_CATEGORIES_EXCLUSES}
 
-    for channel in interaction.guild.text_channels:
-        if channel.name.lower() in noms_channels_exclus:
+    for ch in guild.text_channels:
+        if ch.name.lower() in noms_channels_exclus:
             continue
-        if channel.category and channel.category.name.lower() in noms_categories_exclus:
+        if ch.category and ch.category.name.lower() in noms_categories_exclus:
             continue
-        perms = channel.permissions_for(interaction.guild.me)
+        perms = ch.permissions_for(guild.me)
         if not perms.read_message_history:
             continue
         try:
-            async for msg in channel.history(limit=200):
+            async for msg in ch.history(limit=200):
                 if (
                     not msg.author.bot
                     and MIN_CHARS <= len(msg.content) <= MAX_CHARS
                     and _message_est_valide(msg)
-                    and _a_role_suffisant(msg.author, interaction.guild)
+                    and _a_role_suffisant(msg.author, guild)
                 ):
                     candidats.append(msg)
         except (discord.Forbidden, discord.HTTPException):
@@ -334,17 +419,66 @@ async def _piocher_message(interaction: discord.Interaction):
         return None
     return random.choice(candidats)
 
+async def _lancer_manche(channel: discord.TextChannel, guild: discord.Guild):
+    """Lance une nouvelle manche (relancement auto après bonne réponse ou timer)."""
+    guild_id = guild.id
+    if guild_id in parties_en_cours:
+        return
+
+    await channel.send("🕵️‍♀️ **Je cherche un message mystère...**")
+
+    message_cible = await _piocher_message_guild(guild)
+    if not message_cible:
+        await channel.send("❌ Impossible de trouver un message valide pour la prochaine manche !")
+        return
+
+    auteur  = message_cible.author
+    contenu = message_cible.content
+    annee   = message_cible.created_at.year
+
+    parties_en_cours[guild_id] = {
+        "auteur_id":  auteur.id,
+        "auteur_nom": auteur.display_name,
+        "message_id": message_cible.id,
+        "channel_id": channel.id,
+        "task":       None,
+        "reponses":   {},
+        "a_repondu":  False,
+    }
+
+    embed = discord.Embed(
+        title="🥸  Qui a écrit ce message en " + str(annee) + " ?",
+        description=f"```{contenu}```",
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"⏳ Vous avez {TIMER_SECONDES} secondes — écrivez le pseudo dans le chat !")
+    await channel.send(embed=embed)
+
+    task = asyncio.create_task(_timer_fin(channel.id, guild_id))
+    parties_en_cours[guild_id]["task"] = task
+
 async def _timer_fin(channel_id, guild_id):
     await asyncio.sleep(TIMER_SECONDES)
-    if guild_id in parties_en_cours:
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(channel_id)
-            except Exception:
-                del parties_en_cours[guild_id]
-                return
-        await _terminer_partie(channel, guild_id, reveler=True)
+    if guild_id not in parties_en_cours:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            del parties_en_cours[guild_id]
+            return
+
+    a_repondu = parties_en_cours[guild_id]["a_repondu"]
+    await _terminer_partie(channel, guild_id, reveler=True)
+
+    if a_repondu:
+        await asyncio.sleep(3)
+        await _lancer_manche(channel, channel.guild)
+    else:
+        await asyncio.sleep(1)
+        await channel.send("🥹 **Personne n'a répondu, vous ne voulez plus jouer ? Ok, fin de la partie alors...** 👉👈")
 
 async def _terminer_partie(channel, guild_id, reveler=False, force_stop=False):
     if guild_id not in parties_en_cours:
@@ -360,9 +494,28 @@ async def _terminer_partie(channel, guild_id, reveler=False, force_stop=False):
             color = discord.Color.red()
 
         embed = discord.Embed(title="❌ Personne n'a deviné, bande de nullos. 🤢", description=desc, color=color)
-        await channel.send(embed=embed)
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            print(f"[ERREUR] Pas la permission d'écrire dans #{channel.name}. Gênant le man.")
+        except Exception as e:
+            print(f"[ERREUR] {e}")
 
     del parties_en_cours[guild_id]
+
+# ── Boucle automatique (1 partie/heure) ──
+async def boucle_auto():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(3600)
+        for guild in bot.guilds:
+            channel = discord.utils.get(guild.text_channels, name=CHANNEL_AUTO)
+            if channel is None:
+                continue
+            if guild.id in parties_en_cours:
+                continue
+            session_reset(guild.id)
+            await _lancer_manche(channel, guild)
 
 # ── Lancement ─────────────────────────────
 bot.run(TOKEN)
