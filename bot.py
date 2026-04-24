@@ -12,32 +12,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────
-#  CONFIG  →  modifie ces valeurs
+#  CONFIG  →  chargée depuis .env
 # ─────────────────────────────────────────
 TOKEN = os.getenv('TOKEN')
-TIMER_SECONDES = 60
+TIMER_SECONDES = int(os.getenv('TIMER_SECONDES', '60'))
+MIN_CHARS = int(os.getenv('MIN_CHARS', '20'))
+MAX_CHARS = int(os.getenv('MAX_CHARS', '300'))
+POINTS_VICTOIRE = int(os.getenv('POINTS_VICTOIRE', '1'))
+MAX_REPONSES_PAR_JOUEUR = int(os.getenv('MAX_REPONSES_PAR_JOUEUR', '2'))
+ROLE_MINIMUM = os.getenv('ROLE_MINIMUM', 'Prokobz')
 
-MIN_CHARS = 20
-MAX_CHARS = 300
-POINTS_VICTOIRE = 1
-
-# Noms exacts des channels à exclure (insensible à la casse)
+# Charger les listes depuis .env (séparées par des virgules)
 NOMS_CHANNELS_EXCLUS = [
-    "lp-tracker",
-    "☎️-gartic-phone",
-    "🎥stream",
-    "🎵dj-fred",
-    "🏠images-minecraft",
+    ch.strip() for ch in os.getenv('NOMS_CHANNELS_EXCLUS', 'lp-tracker').split(',')
 ]
 
-# Noms exacts des catégories à exclure (insensible à la casse)
 NOMS_CATEGORIES_EXCLUSES = [
-    "📈Mudae",
+    cat.strip() for cat in os.getenv('NOMS_CATEGORIES_EXCLUSES', '📈Mudae').split(',')
 ]
-
-# Rôle minimum requis pour que les messages soient sélectionnés
-# Le bot sélectionne les membres ayant CE rôle OU un rôle "supérieur" dans la hiérarchie
-ROLE_MINIMUM = "Prokobz"
 # ─────────────────────────────────────────
 
 # Regex pour détecter les liens, mentions, commandes
@@ -135,6 +127,7 @@ async def startgame(interaction: discord.Interaction):
 
     auteur  = message_cible.author
     contenu = message_cible.content
+    annee = message_cible.created_at.year
 
     parties_en_cours[guild_id] = {
         "auteur_id":  auteur.id,
@@ -146,7 +139,7 @@ async def startgame(interaction: discord.Interaction):
     }
 
     embed = discord.Embed(
-        title="🥸 Qui a écrit ce message ?",
+        title="🥸  Qui a écrit ce message en " + str(annee) +" ?",
         description=f"```{contenu}```",
         color=discord.Color.blurple()
     )
@@ -237,7 +230,7 @@ async def aide(interaction: discord.Interaction):
     embed.add_field(name="/classement", value="Affiche le top 10 du serveur",        inline=False)
     embed.add_field(name="/monstats",   value="Tes points, victoires et classement", inline=False)
     embed.add_field(name="/stopgame",   value="(Admin) Arrête la partie en cours",   inline=False)
-    embed.set_footer(text=f"Timer : {TIMER_SECONDES}s  •  Rôle minimum : {ROLE_MINIMUM}")
+    embed.set_footer(text=f"Timer : {TIMER_SECONDES}s  •  Rôle minimum : {ROLE_MINIMUM}  •  Max réponses : {MAX_REPONSES_PAR_JOUEUR}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -259,10 +252,10 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
-    # Vérifier si l'utilisateur a déjà répondu 2 fois
+    # Vérifier si l'utilisateur a déjà répondu MAX_REPONSES_PAR_JOUEUR fois
     user_id = message.author.id
-    if partie["reponses"].get(user_id, 0) >= 2:
-        await message.channel.send(f"🙈 {message.author.mention} a dépassé son quota de réponses (2) pour cette manche ! 👮‍♀️🫵")
+    if partie["reponses"].get(user_id, 0) >= MAX_REPONSES_PAR_JOUEUR:
+        await message.channel.send(f"🙈 {message.author.mention} a dépassé son quota de réponses ({MAX_REPONSES_PAR_JOUEUR}) pour cette manche ! 👮‍♀️🫵")
         await bot.process_commands(message)
         return
 
