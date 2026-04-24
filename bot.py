@@ -8,6 +8,7 @@ import re
 import os
 import uuid
 from dotenv import load_dotenv
+import emoji
 
 # Charger les variables d'environnement depuis .env
 load_dotenv()
@@ -178,6 +179,7 @@ async def startgame(interaction: discord.Interaction):
 
     auteur  = message_cible.author
     contenu = message_cible.content
+    channelAuteur  = message_cible.channel
     annee   = message_cible.created_at.year
 
     parties_en_cours[guild_id] = {
@@ -198,7 +200,7 @@ async def startgame(interaction: discord.Interaction):
     embed.set_footer(text=f"⏳ Vous avez {TIMER_SECONDES} secondes — écrivez le pseudo dans le chat !")
     await interaction.edit_original_response(content=None, embed=embed)
 
-    task = asyncio.create_task(_timer_fin(interaction.channel_id, guild_id))
+    task = asyncio.create_task(_timer_fin(interaction.channel_id, guild_id, channelAuteur))
     parties_en_cours[guild_id]["task"] = task
 
 
@@ -295,7 +297,7 @@ async def stopgame(interaction: discord.Interaction):
     channel = bot.get_channel(parties_en_cours[guild_id]["channel_id"])
     if channel is None:
         channel = await bot.fetch_channel(parties_en_cours[guild_id]["channel_id"])
-    await _terminer_partie(channel, guild_id, reveler=True, force_stop=True)
+    await _terminer_partie(channel, guild_id, None, reveler=True, force_stop=True)
 
 
 @bot.tree.command(name="aide", description="Affiche toutes les commandes disponibles")
@@ -325,6 +327,10 @@ async def on_message(message):
     partie = parties_en_cours[guild_id]
 
     if message.channel.id != partie["channel_id"]:
+        await bot.process_commands(message)
+        return
+
+    if not _message_est_valide(message):
         await bot.process_commands(message)
         return
 
@@ -388,6 +394,10 @@ def _message_est_valide(msg: discord.Message) -> bool:
         return False
     if re.search(r"<a?:\w+:\d+>", msg.content):
         return False
+    if msg.content.strip().startswith(':') and msg.content.strip().endswith(':'):
+        return False
+    if emoji.emoji_count(msg.content.strip()) > 0 and not any(c.isalnum() for c in msg.content):
+        return False
     return True
 
 async def _piocher_message_guild(guild: discord.Guild):
@@ -434,6 +444,7 @@ async def _lancer_manche(channel: discord.TextChannel, guild: discord.Guild):
 
     auteur  = message_cible.author
     contenu = message_cible.content
+    channelAuteur = message_cible.channel
     annee   = message_cible.created_at.year
 
     parties_en_cours[guild_id] = {
@@ -454,10 +465,10 @@ async def _lancer_manche(channel: discord.TextChannel, guild: discord.Guild):
     embed.set_footer(text=f"⏳ Vous avez {TIMER_SECONDES} secondes — écrivez le pseudo dans le chat !")
     await channel.send(embed=embed)
 
-    task = asyncio.create_task(_timer_fin(channel.id, guild_id))
+    task = asyncio.create_task(_timer_fin(channel.id, guild_id, channelAuteur))
     parties_en_cours[guild_id]["task"] = task
 
-async def _timer_fin(channel_id, guild_id):
+async def _timer_fin(channel_id, guild_id, channelAuteur):
     await asyncio.sleep(TIMER_SECONDES)
     if guild_id not in parties_en_cours:
         return
@@ -471,16 +482,16 @@ async def _timer_fin(channel_id, guild_id):
             return
 
     a_repondu = parties_en_cours[guild_id]["a_repondu"]
-    await _terminer_partie(channel, guild_id, reveler=True)
+    await _terminer_partie(channel, guild_id, channelAuteur, reveler=True)
 
     if a_repondu:
         await asyncio.sleep(3)
         await _lancer_manche(channel, channel.guild)
     else:
         await asyncio.sleep(1)
-        await channel.send("🥹 **Personne n'a répondu, vous ne voulez plus jouer ? Ok, fin de la partie alors...** 👉👈")
+        await channel.send("🥹 **Personne n'a répondu, vous ne voulez plus jouer ? \n Ok, fin de la partie alors...** 👉👈")
 
-async def _terminer_partie(channel, guild_id, reveler=False, force_stop=False):
+async def _terminer_partie(channel, guild_id, channelAuteur,reveler=False, force_stop=False):
     if guild_id not in parties_en_cours:
         return
     partie = parties_en_cours[guild_id]
@@ -490,7 +501,7 @@ async def _terminer_partie(channel, guild_id, reveler=False, force_stop=False):
             desc  = f"🛑 Partie arrêtée.\nL'auteur était **{partie['auteur_nom']}** ! ☝️🤓"
             color = discord.Color.orange()
         else:
-            desc  = f"⏰ Temps écoulé ! Personne n'a trouvé...\n Actually l'auteur était **{partie['auteur_nom']}** ! ☝️🤓"
+            desc  = f"⏰ Temps écoulé ! Personne n'a trouvé...\n Actually l'auteur était **{partie['auteur_nom']}**\n dans le channel **{channelAuteur}**  ! ☝️🤓"
             color = discord.Color.red()
 
         embed = discord.Embed(title="❌ Personne n'a deviné, bande de nullos. 🤢", description=desc, color=color)
