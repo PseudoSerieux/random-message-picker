@@ -1,5 +1,6 @@
 import discord
 from discord import app_commands
+from discord import channel
 from discord.ext import commands
 import sqlite3
 import random
@@ -187,6 +188,7 @@ async def startgame(interaction: discord.Interaction):
         "auteur_nom": auteur.display_name,
         "message_id": message_cible.id,
         "channel_id": interaction.channel_id,
+        "channel_auteur_id": channelAuteur.id,
         "task":       None,
         "reponses":   {},
         "a_repondu":  False,
@@ -200,8 +202,11 @@ async def startgame(interaction: discord.Interaction):
     embed.set_footer(text=f"⏳ Vous avez {TIMER_SECONDES} secondes — écrivez le pseudo dans le chat !")
     await interaction.edit_original_response(content=None, embed=embed)
 
-    task = asyncio.create_task(_timer_fin(interaction.channel_id, guild_id, channelAuteur))
+    task = asyncio.create_task(_timer_fin(interaction.channel_id, guild_id))
     parties_en_cours[guild_id]["task"] = task
+
+    # Message à la moitié du temps (concurrent)
+    half_task = asyncio.create_task(_send_half_message(interaction.channel, TIMER_SECONDES, guild_id))
 
 
 @bot.tree.command(name="classement", description="Affiche le classement de la session en cours")
@@ -225,7 +230,7 @@ async def classement(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🏆  Classement — session en cours",
         description="\n".join(lignes),
-        color=discord.Color.gold()
+        color=discord.Color.random()
     )
     embed.set_footer(text=f"Serveur : {interaction.guild.name}  •  Reset à chaque /startgame")
     await interaction.response.send_message(embed=embed)
@@ -297,7 +302,7 @@ async def stopgame(interaction: discord.Interaction):
     channel = bot.get_channel(parties_en_cours[guild_id]["channel_id"])
     if channel is None:
         channel = await bot.fetch_channel(parties_en_cours[guild_id]["channel_id"])
-    await _terminer_partie(channel, guild_id, None, reveler=True, force_stop=True)
+    await _terminer_partie(channel, guild_id, reveler=True, force_stop=True)
 
 
 @bot.tree.command(name="aide", description="Affiche toutes les commandes disponibles")
@@ -349,6 +354,9 @@ async def on_message(message):
     nom_auteur = partie["auteur_nom"].lower().strip()
     reponse    = message.content.lower().strip()
 
+    origin_channel = bot.get_channel(partie["channel_auteur_id"])
+    origin_name = origin_channel.name if origin_channel else f"<#{partie['channel_auteur_id']}>"
+
     if reponse == nom_auteur or reponse in nom_auteur or nom_auteur in reponse:
         if partie["task"]:
             partie["task"].cancel()
@@ -360,7 +368,8 @@ async def on_message(message):
             title="💃 Bonne réponse !",
             description=(
                 f"🎉 **{message.author.display_name}** a trouvé !\n"
-                f"Le message a été écrit par **{partie['auteur_nom']}**.\n"
+                f"Le message a été écrit par **{partie['auteur_nom']}**\n"
+                f"dans le channel **{origin_name}**.\n\n"
                 f"+{pts} point{'s' if pts > 1 else ''} au classement ! 😎"
             ),
             color=discord.Color.green()
@@ -452,6 +461,7 @@ async def _lancer_manche(channel: discord.TextChannel, guild: discord.Guild):
         "auteur_nom": auteur.display_name,
         "message_id": message_cible.id,
         "channel_id": channel.id,
+        "channel_auteur_id": channelAuteur.id,
         "task":       None,
         "reponses":   {},
         "a_repondu":  False,
@@ -465,10 +475,13 @@ async def _lancer_manche(channel: discord.TextChannel, guild: discord.Guild):
     embed.set_footer(text=f"⏳ Vous avez {TIMER_SECONDES} secondes — écrivez le pseudo dans le chat !")
     await channel.send(embed=embed)
 
-    task = asyncio.create_task(_timer_fin(channel.id, guild_id, channelAuteur))
+    task = asyncio.create_task(_timer_fin(channel.id, guild_id))
     parties_en_cours[guild_id]["task"] = task
 
-async def _timer_fin(channel_id, guild_id, channelAuteur):
+    # Message à la moitié du temps (concurrent)
+    half_task = asyncio.create_task(_send_half_message(channel, TIMER_SECONDES, guild_id))
+
+async def _timer_fin(channel_id, guild_id):
     await asyncio.sleep(TIMER_SECONDES)
     if guild_id not in parties_en_cours:
         return
@@ -482,7 +495,7 @@ async def _timer_fin(channel_id, guild_id, channelAuteur):
             return
 
     a_repondu = parties_en_cours[guild_id]["a_repondu"]
-    await _terminer_partie(channel, guild_id, channelAuteur, reveler=True)
+    await _terminer_partie(channel, guild_id, reveler=True)
 
     if a_repondu:
         await asyncio.sleep(3)
@@ -491,20 +504,30 @@ async def _timer_fin(channel_id, guild_id, channelAuteur):
         await asyncio.sleep(1)
         await channel.send("🥹 **Personne n'a répondu, vous ne voulez plus jouer ? \n Ok, fin de la partie alors...** 👉👈")
 
-async def _terminer_partie(channel, guild_id, channelAuteur,reveler=False, force_stop=False):
+async def _send_half_message(channel, timer, guild_id):
+    await asyncio.sleep(timer / 2)
+    if guild_id in parties_en_cours:
+        await channel.send(f"🐰⏳ Tic tac le temps file ! Il reste {timer / 2} secondes. 🤓")
+
+async def _terminer_partie(channel, guild_id,reveler=False, force_stop=False):
     if guild_id not in parties_en_cours:
         return
     partie = parties_en_cours[guild_id]
 
+    origin_channel = bot.get_channel(partie["channel_auteur_id"])
+    origin_name = origin_channel.name if origin_channel else f"<#{partie['channel_auteur_id']}>"
+
     if reveler:
         if force_stop:
-            desc  = f"🛑 Partie arrêtée.\nL'auteur était **{partie['auteur_nom']}** ! ☝️🤓"
-            color = discord.Color.orange()
-        else:
-            desc  = f"⏰ Temps écoulé ! Personne n'a trouvé...\n Actually l'auteur était **{partie['auteur_nom']}**\n dans le channel **{channelAuteur}**  ! ☝️🤓"
+            title = "🛑 Partie arrêtée, get daronned apparemment. 🚨"
+            desc  = f"Actually l'auteur était **{partie['auteur_nom']}**,\n dans le channel **{origin_name}**  ! ☝️🤓\n\n A plus tard les nullards ! 👋😎"
             color = discord.Color.red()
+        else:
+            title = "❌ Personne n'a deviné, bande de nullos. 🤢"
+            desc  = f"⏰ Temps écoulé !\nActually l'auteur était **{partie['auteur_nom']}**,\n dans le channel **{origin_name}** ! ☝️🤓"
+            color = discord.Color.dark_magenta()
 
-        embed = discord.Embed(title="❌ Personne n'a deviné, bande de nullos. 🤢", description=desc, color=color)
+        embed = discord.Embed(title=title, description=desc, color=color)
         try:
             await channel.send(embed=embed)
         except discord.Forbidden:

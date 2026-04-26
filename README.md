@@ -1,6 +1,8 @@
 # random-message-picker
 Creation of a bot picking random messages for Discord 🕹️
 
+Command to launch the bot in local : `python bot.py`
+
 # Requirements
 discord.py>=2.3.0
 python-dotenv
@@ -9,12 +11,12 @@ python-dotenv
 
 | Commande | Description |
 |----------|-------------|
-| `!startgame` | Start a gaming session |
-| `!classement` | Standings for the current session |
-| `!classement-global` | Standings all-time |
-| `!messtats` | Personal points all-time |
-| `!stopgame` | End the session |
-| `!aide` | Displays the available commands |
+| `/startgame` | Start a gaming session |
+| `/classement` | Standings for the current session |
+| `/classement-global` | Standings all-time |
+| `/messtats` | Personal points all-time |
+| `/stopgame` | End the session |
+| `/aide` | Displays the available commands |
 
 # ⚙️ .env file
 The bot need an .env file to work properly. So an example is available as `.env-example` among the files.
